@@ -1,21 +1,63 @@
 const express = require('express');
+const db = require('./database'); 
+
 const app = express();
 app.use(express.json());
 
-// Base de datos simulada en memoria
-let celdas = [
-    { id: 1, numero: 'A-101', estado: 'Disponible' },
-    { id: 2, numero: 'A-102', estado: 'Disponible' },
-    { id: 3, numero: 'B-201', estado: 'No disponible' }
-];
-let registros = [];
-let novedades = [];
+//Reegista usuarios mensualisado
+app.post('/api/usuarios', (req, res) => {
+    const { cedula, nombre, telefono, correo } = req.body;
 
-// 1. Endpoint: Consultar celdas
-app.get('/api/celdas', (req, res) => {
-    res.json({ 
-        status: 'Éxito', 
-        celdas 
+    if(!cedula || !nombre) {
+        return res.status(400).json({
+            status: 'Error',
+            mensaje: 'Cédula y nombre son obligatorios.'
+        });
+    }
+
+    const sql = `INSERT INTO Usuarios (cedula, nombre, telefono, correo) VALUES (?, ?, ?, ?)`;
+    db.run(sql, [cedula, nombre, telefono, correo], function(err) {
+        if (err) {
+            if (err.message.includes('UNIQUE constraint failed')) {
+                return res.status(400).json({
+                    status: 'Error',
+                    mensaje: 'Ya existe un usuario con esta cédula.'
+                });
+            }
+            return res.status(500).json({
+                status: 'Error',
+                mensaje: 'Error al registrar el usuario.'
+            });
+        }
+        return res.status(201).json({
+            status: 'Éxito',
+            mensaje: 'Usuario registrado correctamente.',
+            id_usuario: this.lastID
+        });
+    });
+});
+
+
+//Consultar usuarios
+app.get('/api/usuarios', (req, res) => {
+    const sql = `
+        SELECT u.id_usuario, u.cedula, u.nombre, u.telefono, u.correo, u.estado,
+               GROUP_CONCAT(v.placa) AS vehiculos
+        FROM Usuarios u
+        LEFT JOIN Vehiculos v ON u.id_usuario = v.id_usuario
+        GROUP BY u.id_usuario
+    `;
+    db.all(sql, [], (err, rows) => {
+        if (err) {
+            return res.status(500).json({
+                status: 'Error',
+                mensaje: 'Error al consultar los usuarios.'
+            });
+        }
+        return res.json({
+            status: 'Éxito',
+            usuarios: rows
+        });
     });
 });
 
