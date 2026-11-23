@@ -1,3 +1,4 @@
+// app.js - Sistema Integral Parqueadero Autos Colombia (Iteraciones 1, 2 y 3)
 const express = require('express');
 const db = require('./database');
 
@@ -131,87 +132,228 @@ app.patch('/api/celdas/:id/estado', (req, res) => {
 });
 
 
-//Entradas y Salidas
+//Entradas y Salidas + Validadcion de Pagos de Mensualidad (Iteración 1 y 2) + Gestión de Pagos (Iteración 3)
 
 //Registrar Entrada de Vehículo
 app.post('/api/entradas', (req, res) => {
     const { placa, idCelda, observacion } = req.body;
-    const placaUpper = placa ? placa.toUpperCase() : ' ';
+    const placaUpper = placa ? placa.toUpperCase() : '';
 
-    //Validar que la placa pertenezca a un usuario mensualizado activo
-    const sqlCheckVehiculo = `
-        SELECT v.placa, u.estado AS estado_usuario 
-        FROM Vehiculos v 
-        JOIN Usuarios u ON v.id_usuario = u.id_usuario 
-        WHERE v.placa = ?
-    `;
+    const sqlCheck = `
+    SELECT v.placa, u.nombre, u.estado AS estado_usuario, u.fecha_vencimiento,
+           CASE WHEN DATE(u.fecha_vencimiento) >= DATE('now') THEN 1 ELSE 0 END AS esta_vigente
+    FROM Vehiculos v
+    JOIN Usuarios u ON v.id_usuario = u.id_usuario
+    WHERE v.placa = ?
+  `;
 
-    db.get(sqlCheckVehiculo, [placaUpper], (err, vehiculo) => {
+    db.get(sqlCheck, [placaUpper], (err, info) => {
         if (err) return res.status(500).json({ error: err.message });
-        if (!vehiculo) {
-            return res.status(404).json({ status: 'Error', mensaje: 'El vehículo no está registrado como usuario mensualizado.' });
+        if (!info) {
+            return res.status(404).json({ status: 'Error', mensaje: 'Vehículo no registrado en el sistema de mensualidades.' });
         }
-        if (vehiculo.estado_usuario !== 'Activo') {
-            return res.status(403).json({ status: 'Error', mensaje: 'El usuario propietario tiene la mensualidad suspendida o inactiva.' });
+        if (info.estado_usuario !== 'Activo' || info.esta_vigente === 0) {
+            return res.status(403).json({
+                status: 'Error',
+                mensaje: `Acceso denegado: Mensualidad vencida (Fecha corte: ${info.fecha_vencimiento}). Debe registrar pago en caja.`
+            });
         }
 
-        //Validar que el vehículo no esté ya parqueado en el patio
-        db.get('SELECT * FROM Registros_Acceso WHERE placa = ? AND estado = "Activo"', [placaUpper], (err, registroActivo) => {
-            if (registroActivo) {
-                return res.status(400).json({ status: 'Error', mensaje: 'El vehículo ya se encuentra actualmente dentro del parqueadero.' });
+        db.get('SELECT * FROM Registros_Acceso WHERE placa = ? AND estado = "Activo"', [placaUpper], (err, enPatio) => {
+            if (enPatio) {
+                return res.status(400).json({ status: 'Error', mensaje: 'El vehículo ya se encuentra dentro del parqueadero.' });
             }
 
-            //Validar que la celda exista y esté disponible
             db.get('SELECT * FROM Celdas WHERE id_celda = ? AND estado = "Disponible"', [idCelda], (err, celda) => {
                 if (!celda) {
-                    return res.status(400).json({ status: 'Error', mensaje: 'La celda seleccionada no existe o no está disponible.' });
+                    return res.status(400).json({ status: 'Error', mensaje: 'La celda seleccionada no está disponible.' });
                 }
 
-                // Ejecutar Transacción de Entrada
                 db.serialize(() => {
                     db.run('UPDATE Celdas SET estado = "Ocupada" WHERE id_celda = ?', [idCelda]);
-
-                    const sqlInsertAcceso = `INSERT INTO Registros_Acceso (placa, id_celda, fecha_entrada, estado) VALUES (?, ?, datetime('now'), 'Activo')`;
-                    db.run(sqlInsertAcceso, [placaUpper, idCelda], function (err) {
-                        if (err) return res.status(500).json({ error: err.message });
-
-                        const idRegistro = this.lastID;
-                        if (observacion) {
-                            db.run(`INSERT INTO Novedades (id_registro, descripcion) VALUES (?, ?)`, [idRegistro, observacion]);
+                    db.run(
+                        `INSERT INTO Registros_Acceso (placa, id_celda, fecha_entrada, estado) VALUES (?, ?, datetime('now'), 'Activo')`,
+                        [placaUpper, idCelda],
+                        function (err) {
+                            if (err) return res.status(500).json({ error: err.message });
+                            const idRegistro = this.lastID;
+                            if (observacion) {
+                                db.run(`INSERT INTO Novedades (id_registro, descripcion) VALUES (?, ?)`, [idRegistro, observacion]);
+                            }
+                            res.status(201).json({
+                                status: 'Éxito',
+                                mensaje: 'Entrada autorizada y registrada correctamente.',
+                                registro: { idRegistro, placa: placaUpper, celda: celda.numero_celda, vigencia_hasta: info.fecha_vencimiento }
+                            });
                         }
-
-                        return res.status(201).json({
-                            status: 'Éxito',
-                            mensaje: 'Entrada registrada y celda asignada correctamente.',
-                            registro: { idRegistro, placa: placaUpper, idCelda, celda: celda.numero_celda }
-                        });
-                    });
+                    );
                 });
             });
         });
     });
 });
 
-//Registrar Salida de Vehículo
 app.post('/api/salidas', (req, res) => {
     const { placa } = req.body;
     const placaUpper = placa ? placa.toUpperCase() : '';
 
     db.get('SELECT * FROM Registros_Acceso WHERE placa = ? AND estado = "Activo"', [placaUpper], (err, registro) => {
-        if (err || !registro) {
-            return res.status(404).json({ status: 'Error', mensaje: 'No se encontró un registro de ingreso activo para esta placa.' });
+        if (!registro) {
+            return res.status(404).json({ status: 'Error', mensaje: 'No existe un ingreso activo para la placa ingresada.' });
         }
 
         db.serialize(() => {
-            // Liberar celda
             db.run('UPDATE Celdas SET estado = "Disponible" WHERE id_celda = ?', [registro.id_celda]);
+            db.run(
+                `UPDATE Registros_Acceso SET fecha_salida = datetime('now'), estado = 'Finalizado' WHERE id_registro = ?`,
+                [registro.id_registro],
+                (err) => {
+                    if (err) return res.status(500).json({ error: err.message });
+                    res.json({ status: 'Éxito', mensaje: 'Salida registrada y celda liberada.', id_registro: registro.id_registro });
+                }
+            );
+        });
+    });
+});
 
-            // Finalizar Registro
-            db.run('UPDATE Registros_Acceso SET fecha_salida = datetime("now"), estado = "Finalizado" WHERE id_registro = ?', [registro.id_registro], (err) => {
-                if (err) return res.status(500).json({ error: err.message });
-                return res.json({ status: 'Éxito', mensaje: 'Salida registrada correctamente. Celda liberada.', id_registro: registro.id_registro });
+//Iteracion 3 - Gestión de Pagos
+
+// 3.1 Registrar Pago de Mensualidad con Transacción SQL y Renovación (+30 días)
+app.post('/api/pagos', (req, res) => {
+    const { cedula, monto, metodo_pago, periodo } = req.body;
+
+    if (!cedula || !monto || !metodo_pago || !periodo) {
+        return res.status(400).json({
+            status: 'Error',
+            mensaje: 'Los campos cedula, monto, metodo_pago y periodo (ej. 2026-11) son obligatorios.'
+        });
+    }
+
+    // Verificar existencia del usuario
+    db.get('SELECT * FROM Usuarios WHERE cedula = ?', [cedula], (err, usuario) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!usuario) {
+            return res.status(404).json({ status: 'Error', mensaje: 'No existe un usuario registrado con esa cédula.' });
+        }
+
+        // Validar que no exista un pago confirmado duplicado para el mismo periodo
+        db.get(
+            `SELECT * FROM Pagos WHERE id_usuario = ? AND periodo = ? AND estado_pago = 'Confirmado'`,
+            [usuario.id_usuario, periodo],
+            (err, pagoExistente) => {
+                if (pagoExistente) {
+                    return res.status(409).json({
+                        status: 'Error',
+                        mensaje: `Ya existe un pago registrado para el periodo ${periodo}. Vigencia actual hasta ${usuario.fecha_vencimiento}.`
+                    });
+                }
+
+                // Calcular nueva fecha de vencimiento (+30 días desde hoy o desde su fecha vigente si aún no vence)
+                const sqlCalculoFecha = `
+          SELECT CASE 
+            WHEN DATE(?) >= DATE('now') THEN DATE(?, '+30 days')
+            ELSE DATE('now', '+30 days')
+          END AS nueva_fecha
+        `;
+
+                db.get(sqlCalculoFecha, [usuario.fecha_vencimiento, usuario.fecha_vencimiento], (err, rowFecha) => {
+                    const nuevaFechaVencimiento = rowFecha.nueva_fecha;
+                    const numeroComprobante = `REC-${Date.now()}`;
+
+                    // Ejecutar Transacción Atómica: Insertar Pago + Actualizar Vigencia Usuario
+                    db.serialize(() => {
+                        db.run('BEGIN TRANSACTION');
+
+                        const sqlInsertPago = `
+              INSERT INTO Pagos (numero_comprobante, id_usuario, periodo, monto, metodo_pago, nueva_fecha_vencimiento)
+              VALUES (?, ?, ?, ?, ?, ?)
+            `;
+
+                        db.run(
+                            sqlInsertPago,
+                            [numeroComprobante, usuario.id_usuario, periodo, monto, metodo_pago, nuevaFechaVencimiento],
+                            function (err) {
+                                if (err) {
+                                    db.run('ROLLBACK');
+                                    return res.status(500).json({ status: 'Error', mensaje: 'Error al registrar el pago.', detalle: err.message });
+                                }
+
+                                const idPago = this.lastID;
+                                const sqlUpdateUser = `UPDATE Usuarios SET estado = 'Activo', fecha_vencimiento = ? WHERE id_usuario = ?`;
+
+                                db.run(sqlUpdateUser, [nuevaFechaVencimiento, usuario.id_usuario], (err) => {
+                                    if (err) {
+                                        db.run('ROLLBACK');
+                                        return res.status(500).json({ status: 'Error', mensaje: 'Error al actualizar vigencia del usuario.' });
+                                    }
+
+                                    db.run('COMMIT');
+                                    return res.status(201).json({
+                                        status: 'Éxito',
+                                        mensaje: 'Pago registrado y mensualidad renovada exitosamente.',
+                                        comprobante: {
+                                            id_pago: idPago,
+                                            numero_comprobante: numeroComprobante,
+                                            cliente: usuario.nombre,
+                                            cedula: usuario.cedula,
+                                            periodo,
+                                            monto_cop: monto,
+                                            metodo_pago,
+                                            nueva_fecha_vencimiento: nuevaFechaVencimiento
+                                        }
+                                    });
+                                });
+                            }
+                        );
+                    });
+                });
+            }
+        );
+    });
+});
+
+// 3.2 Consultar Historial de Pagos por Cédula de Usuario
+app.get('/api/pagos/usuario/:cedula', (req, res) => {
+    const { cedula } = req.params;
+
+    db.get('SELECT id_usuario, cedula, nombre, estado, fecha_vencimiento FROM Usuarios WHERE cedula = ?', [cedula], (err, usuario) => {
+        if (!usuario) return res.status(404).json({ status: 'Error', mensaje: 'Usuario no encontrado.' });
+
+        db.all('SELECT * FROM Pagos WHERE id_usuario = ? ORDER BY fecha_pago DESC', [usuario.id_usuario], (err, pagos) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({
+                status: 'Éxito',
+                cliente: usuario,
+                total_pagos: pagos.length,
+                historial_pagos: pagos
             });
         });
     });
 });
 
+// 3.3 Reporte Consolidado de Recaudo Financiero
+app.get('/api/reportes/recaudo', (req, res) => {
+    const sql = `
+    SELECT 
+      COUNT(*) AS total_transacciones,
+      COALESCE(SUM(monto), 0) AS total_recaudado_cop,
+      metodo_pago
+    FROM Pagos
+    WHERE estado_pago = 'Confirmado'
+    GROUP BY metodo_pago
+  `;
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        const granTotal = rows.reduce((acc, item) => acc + item.total_recaudado_cop, 0);
+        res.json({
+            status: 'Éxito',
+            gran_total_recaudado_cop: granTotal,
+            desglose_por_metodo: rows
+        });
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Servidor ejecutándose en http://localhost:${PORT}`);
+});
